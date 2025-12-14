@@ -1,0 +1,1151 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+    <title>手部控制3D圣诞树粒子球</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { overflow: hidden; background-color: #000; font-family: system-ui, Segoe UI, Helvetica, Arial; }
+        #container { position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; }
+        #video { display: none; }
+        .gesture-indicator {
+            position: fixed; top: 20px; left: 50%; transform: translateX(-50%);
+            color: white; font-size: 24px; background: rgba(0,0,0,0.7); padding: 10px 20px;
+            border-radius: 10px; backdrop-filter: blur(5px); border: 1px solid rgba(255,255,255,0.2); z-index: 100;
+        }
+        .status-panel {
+            position: fixed; top: 20px; right: 20px; color: white; background: rgba(0,0,0,0.7);
+            padding: 15px; border-radius: 10px; backdrop-filter: blur(5px); border: 1px solid rgba(255,255,255,0.2);
+            z-index: 100; min-width: 200px;
+        }
+        .status-item { margin: 5px 0; display:flex; justify-content:space-between; }
+        .status-label { color: #aaa; } .status-value { color: #fff; }
+        .mode-indicator { display:inline-block; width:12px; height:12px; border-radius:50%; margin-right:8px; vertical-align:middle; }
+        .mode-tree { background-color: #2d5a3d; } .mode-sphere { background-color: #00aaff; }
+        .ui-hint { position: fixed; left: 16px; bottom: 12px; color: #ddd; font-size: 13px; opacity: 0.8; background: rgba(0,0,0,0.5); padding:8px 12px; border-radius:6px; backdrop-filter: blur(5px); z-index:100; }
+        .vignette { position: fixed; inset: 0; pointer-events: none; background: radial-gradient(ellipse at center, rgba(0,0,0,0) 40%, rgba(0,0,0,0.45) 100%); z-index:50; }
+        #christmas-text {
+            position: fixed;
+            top: 20%;
+            left: 50%;
+            transform: translateX(-50%) rotate(-15deg);
+            font-family: 'Arial', sans-serif;
+            font-style: italic;
+            font-weight: bold;
+            font-size: 48px;
+            color: rgba(255, 255, 255, 0.9);
+            text-shadow: 0 0 10px rgba(255, 50, 50, 0.8), 
+                         0 0 20px rgba(255, 50, 50, 0.6),
+                         0 0 30px rgba(255, 50, 50, 0.4);
+            letter-spacing: 3px;
+            z-index: 10;
+            pointer-events: none;
+            opacity: 0.9;
+        }
+    </style>
+</head>
+<body>
+    <div id="container"></div>
+    <!-- <div id="christmas-text">Merry Christmas</div> -->
+    <div class="gesture-indicator" id="gestureText">等待手部识别...</div>
+    <div class="status-panel">
+        <div class="status-item">
+            <span class="status-label">当前模式:</span>
+            <span class="status-value">
+                <span class="mode-indicator mode-tree" id="modeIndicator"></span>
+                <span id="modeText">圣诞树</span>
+            </span>
+        </div>
+        <div class="status-item">
+            <span class="status-label">转换进度:</span>
+            <span class="status-value" id="transitionText">0%</span>
+        </div>
+        <div class="status-item">
+            <span class="status-label">旋转方向:</span>
+            <span class="status-value" id="rotationText">无</span>
+        </div>
+        <div class="status-item">
+            <span class="status-label">手势识别:</span>
+            <span class="status-value" id="handStatusText">未检测到</span>
+        </div>
+    </div>
+    <div class="ui-hint">拇指+食指捏合（pinch）→ 圣诞树；拇指与食指分开并伸展（更大间距才触发）→ 粒子球；左右拨动手指控制旋转</div>
+    <div class="vignette"></div>
+    <video id="video" autoplay playsinline></video>
+
+    <!-- Three.js 和 MediaPipe Hands -->
+    <script src="https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4/hands.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils@0.3/camera_utils.min.js"></script>
+
+    <script>
+        // 手部识别变量
+        let handPoints = null, handLines = null;
+        const instanceCount = 21;
+        let frameCount = 0;
+        let lastWristPos = null;
+        let lastSwipeTime = 0;
+        let lastFingersCenterPos = null;
+        let lastSwipeInfo = null;
+
+        // 新增：用于阻止短时间内相反方向的拨动判定（例如：左拨后 1 秒内忽略右拨）
+        let lastDetectedSwipeDirection = 0; // 1 = 右, -1 = 左, 0 = 无
+        let lastDetectedSwipeTimestamp = 0; // ms
+        const SWIPE_BLOCK_MS = 1000; // 阻止相反判定的时间窗口（毫秒）
+
+        let gestureText = null, handStatusText = null, modeText = null, modeIndicator = null, transitionText = null, rotationText = null;
+
+        const hands = new Hands({ locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4/${file}` });
+        hands.setOptions({ maxNumHands: 1, modelComplexity: 1, minDetectionConfidence: 0.5, minTrackingConfidence: 0.5 });
+
+        const connections = [
+            [0,1],[1,2],[2,3],[3,4],
+            [0,5],[5,6],[6,7],[7,8],
+            [0,9],[9,10],[10,11],[11,12],
+            [0,13],[13,14],[14,15],[15,16],
+            [0,17],[17,18],[18,19],[19,20],
+            [5,9],[9,13],[13,17]
+        ];
+
+        // ---------- 手势检测函数（pinch / 拇指食指分开并伸展） ----------
+        function distance(p1, p2) {
+            const dx = p1.x - p2.x;
+            const dy = p1.y - p2.y;
+            const dz = (p1.z || 0) - (p2.z || 0);
+            return Math.hypot(dx, dy, dz);
+        }
+
+        // 判断是否为捏合（拇指与食指靠近）
+        function isPinch(landmarks) {
+            if (!landmarks || landmarks.length < 9) return false;
+            const thumbTip = landmarks[4];
+            const indexTip = landmarks[8];
+            const middleTip = landmarks[12];
+            const wrist = landmarks[0];
+            // 手大小参考：wrist 与 middleTip 的距离
+            const handSize = Math.hypot(wrist.x - middleTip.x, wrist.y - middleTip.y) || 0.0001;
+            const tipDist = distance(thumbTip, indexTip);
+            // 阈值：当拇指与食指距离小于手大小的 0.22 时认为是捏合（与之前一致）
+            return tipDist < handSize * 0.22;
+        }
+
+        // 新增：连续检测计数，减少抖动
+        let apartCount = 0;
+        let pinchCount = 0;
+        const REQUIRED_CONSECUTIVE = 4; // 需要连续检测到几次才切换（可调）
+
+        // 判断拇指与食指是否分开并且食指伸展（分开并伸展 → 粒子球）
+        function isThumbIndexApartAndExtended(landmarks) {
+            if (!landmarks || landmarks.length < 9) return false;
+            const thumbTip = landmarks[4];
+            const indexTip = landmarks[8];
+            const indexPIP = landmarks[6]; // index 指的中关节
+            const middleTip = landmarks[12];
+            const wrist = landmarks[0];
+            // 手大小参考：wrist 与 middleTip 的距离
+            const handSize = Math.hypot(wrist.x - middleTip.x, wrist.y - middleTip.y) || 0.0001;
+            const tipDist = distance(thumbTip, indexTip);
+            const indexExtend = distance(indexTip, indexPIP); // 指尖与近节的距离，伸展时较大
+            const indexFromWrist = distance(indexTip, wrist);
+
+            // 调整后的更严格阈值（需要明显分开才触发）
+            // 1) 拇指与食指距离大于手大小的 0.85（更明显分开）
+            // 2) 食指伸展：indexExtend 相对于 handSize 足够大（>0.22）
+            // 3) 食指远离腕部（>0.6）
+            return tipDist > handSize * 0.85 && indexExtend > handSize * 0.22 && indexFromWrist > handSize * 0.6;
+        }
+        // ----------------------------------------------------------------
+
+        hands.onResults((results) => {
+            if (handPoints) handPoints.visible = false;
+            if (handLines) handLines.visible = false;
+
+            if (!results.multiHandLandmarks || results.multiHandLandmarks.length === 0) {
+                handStatusText.textContent = "未检测到";
+                // reset counts to avoid accidental switches when hand reappears
+                apartCount = 0;
+                pinchCount = 0;
+                // reset swipe trackers
+                lastFingersCenterPos = null;
+                lastWristPos = null;
+                return;
+            }
+
+            const landmarks = results.multiHandLandmarks[0];
+            handStatusText.textContent = "已检测到";
+
+            // 检测是否握拳 —— 如果握拳则不会判定为拨动（用户要求）
+            const fistDetected = isFist(landmarks);
+            if (fistDetected) {
+                // 给用户提示并重置与拨动相关的临时缓存，避免握拳期间残留触发
+                gestureText.textContent = '握拳 - 拨动已被禁用';
+                lastFingersCenterPos = null;
+                lastWristPos = { x: landmarks[0].x, y: landmarks[0].y };
+            }
+
+            // 更新手部关键点（InstancedMesh）
+            if (handPoints) {
+                const dummy = new THREE.Object3D();
+                for (let i = 0; i < instanceCount; i++) {
+                    const lm = landmarks[i];
+                    if (!lm) continue;
+                    const x = (lm.x - 0.5) * 10;
+                    const y = -(lm.y - 0.5) * 10;
+                    const z = -lm.z * 5;
+                    dummy.position.set(x, y, z);
+                    dummy.updateMatrix();
+                    handPoints.setMatrixAt(i, dummy.matrix);
+                }
+                handPoints.instanceMatrix.needsUpdate = true;
+                handPoints.visible = false;
+            }
+
+            // 更新连线（LineSegments）
+            if (handLines) {
+                const posAttr = handLines.geometry.getAttribute('position');
+                let idx = 0;
+                for (const [s, e] of connections) {
+                    const sp = landmarks[s];
+                    const ep = landmarks[e];
+                    const sx = (sp.x - 0.5) * 10;
+                    const sy = -(sp.y - 0.5) * 10;
+                    const sz = -sp.z * 5;
+                    const ex = (ep.x - 0.5) * 10;
+                    const ey = -(ep.y - 0.5) * 10;
+                    const ez = -ep.z * 5;
+                    posAttr.array[idx++] = sx; posAttr.array[idx++] = sy; posAttr.array[idx++] = sz;
+                    posAttr.array[idx++] = ex; posAttr.array[idx++] = ey; posAttr.array[idx++] = ez;
+                }
+                posAttr.needsUpdate = true;
+                handLines.visible = true;
+            }
+
+            // 每3帧判断手势（改为：pinch -> 圣诞树，thumb+index apart & extended -> 粒子球）
+            frameCount++;
+            if (frameCount % 3 === 0) {
+                const pinchDetected = isPinch(landmarks);
+                const apartDetected = isThumbIndexApartAndExtended(landmarks);
+
+                // 处理捏合计数 & apart 计数（互斥）
+                if (pinchDetected) {
+                    pinchCount++;
+                    apartCount = 0;
+                } else if (apartDetected) {
+                    apartCount++;
+                    pinchCount = 0;
+                } else {
+                    // 两者都不满足 -> 递减计数（防止瞬时噪声保留）
+                    pinchCount = Math.max(0, pinchCount - 1);
+                    apartCount = Math.max(0, apartCount - 1);
+                }
+
+                // 需要连续检测到 REQUIRED_CONSECUTIVE 次才切换为对应模式
+                if (pinchCount >= REQUIRED_CONSECUTIVE) {
+                    gestureText.textContent = '拇指+食指捏合 - 圣诞树形态';
+                    if (particleSphereMode) {
+                        particleSphereMode = false;
+                        updateModeDisplay();
+                    }
+                } else if (apartCount >= REQUIRED_CONSECUTIVE) {
+                    gestureText.textContent = '拇指+食指分开并伸展 - 粒子球形态';
+                    if (!particleSphereMode) {
+                        particleSphereMode = true;
+                        updateModeDisplay();
+                    }
+
+                    // 为每个粒子系统生成球体目标位置（球体居中于原点）
+                    allParticleSystems.forEach((system, systemIndex) => {
+                        const count = system.originalPositions.length / 3;
+                        let radius = sphereRadius;
+                        if (systemIndex < 2) radius *= 0.95;
+                        else if (systemIndex < 5) radius *= 1.0;
+                        else radius *= 0.9;
+
+                        // 生成以原点为中心的球体位置（不要把球偏移到树中心）
+                        const spherePositions = generateSpherePositions(count, radius);
+
+                        // 添加较小随机扰动，但不改变球体中心（确保球体中心始终在原点）
+                        for (let i = 0; i < spherePositions.length; i += 3) {
+                            spherePositions[i] += (Math.random() - 0.5) * radius * 0.03;
+                            spherePositions[i + 1] += (Math.random() - 0.5) * radius * 0.03;
+                            spherePositions[i + 2] += (Math.random() - 0.5) * radius * 0.03;
+                        }
+
+                        system.spherePositions = spherePositions;
+                    });
+                } else {
+                    // 未连续达到阈值，提示保持动作
+                    // 如果当前为握拳，则优先显示握拳提示（避免被覆盖）
+                    if (!fistDetected) {
+                        gestureText.textContent = '请持续将拇指与食指捏合 / 明显分开以切换形态';
+                    }
+                }
+
+                frameCount = 0;
+            }
+
+            // 检测拨动手势（用于旋转）
+            // detectSwipe 内部也会检测握拳并在握拳时短路返回 null
+            const swipeDir = detectSwipe(landmarks);
+            if (swipeDir) gestureText.textContent = `拨动: ${swipeDir}`;
+
+            if (lastSwipeInfo) {
+                const direction = lastSwipeInfo.direction;
+                const speed = Math.min(Math.max(lastSwipeInfo.swipeSpeed, 0.5), 8);
+                rotationVelocity = speed * 0.04;
+                rotationDirection = direction;
+                rotationText.textContent = direction === 1 ? '向右' : '向左';
+                lastSwipeInfo = null;
+            }
+
+            lastWristPos = { x: landmarks[0].x, y: landmarks[0].y };
+        });
+
+        // 其余代码（3D 场景、粒子系统等）与原文件保持一致
+        // 为了简洁，以下代码与之前逻辑相同 —— 完整性保留
+
+        // 3D 场景变量
+        let scene, camera, renderer;
+        let treeGroup = null;
+        let particleSphereMode = false;
+        let sphereModeProgress = 0;
+        const TRANSITION_SPEED = 0.02;
+        let sphereRadius = 10;
+        const initialCameraZ = 18; // 相机固定
+        let allParticleSystems = [];
+        let rotationVelocity = 0;
+        let rotationDirection = 1; // 默认向右旋转
+        const autoRotationSpeed = 0.005; // 自动旋转速度
+        const BLOOM_LAYER = 1;
+        // --------- ambient dots (空间光点) 变量 ----------
+        let ambientPointsData = null; // 会保存 { points, geometry, basePositions, phases }
+        let treeAmbientPointsData = null; // 用于圣诞树模式下的额外环境光点
+
+
+        function initThreeJS() {
+            scene = new THREE.Scene();
+
+            camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 200);
+            camera.position.set(0, 6, initialCameraZ);
+            camera.lookAt(0, 0, 0); // 固定观察场景原点
+
+            renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setClearColor(0x000000);
+
+            // 镜像渲染（水平翻转）
+            renderer.domElement.style.transform = 'scaleX(-1)';
+            document.getElementById('container').appendChild(renderer.domElement);
+
+            setupLights();
+            window.addEventListener('resize', onWindowResize);
+
+            createHandPoints();
+            createHandLines();
+            createTreeParticleSystem();
+
+            // 确保 treeGroup 在原点（屏幕正中）
+            if (treeGroup) treeGroup.position.set(0, 0, 0);
+
+            animate();
+        }
+
+        function setupLights() {
+            const dir = new THREE.DirectionalLight(0xffffff, 0.40);
+            dir.position.set(-5, 12, 6); scene.add(dir);
+            const rim = new THREE.PointLight(0xffcc99, 0.6, 30); rim.position.set(7,8,7); scene.add(rim);
+            const rim2 = new THREE.PointLight(0xff8844, 0.4, 28); rim2.position.set(-7,6,-7); scene.add(rim2);
+            const coolRim = new THREE.PointLight(0x66aaff, 0.18, 30); coolRim.position.set(-6,12,-3); scene.add(coolRim);
+            const warmFill = new THREE.PointLight(0xffd580, 0.22, 22); warmFill.position.set(3,2,4); scene.add(warmFill);
+            const fill = new THREE.AmbientLight(0x3d3d3d, 0.8); scene.add(fill);
+        }
+
+        function createHandPoints() {
+            const geometry = new THREE.SphereGeometry(0.05, 8, 8);
+            const material = new THREE.MeshBasicMaterial({ color: 0x00ff00 });
+            handPoints = new THREE.InstancedMesh(geometry, material, instanceCount);
+            handPoints.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+            handPoints.matrixAutoUpdate = false;
+            handPoints.visible = false;
+            handPoints.position.z = -5;
+            scene.add(handPoints);
+        }
+
+        function createHandLines() {
+            const connectionCount = 23;
+            const vertices = new Float32Array(connectionCount * 2 * 3);
+            const geometry = new THREE.BufferGeometry();
+            geometry.setAttribute('position', new THREE.BufferAttribute(vertices, 3));
+            geometry.setDrawRange(0, connectionCount * 2);
+            const material = new THREE.LineBasicMaterial({ color: 0xffffff });
+            handLines = new THREE.LineSegments(geometry, material);
+            handLines.frustumCulled = false;
+            handLines.visible = false;
+            handLines.position.z = -5;
+            scene.add(handLines);
+        }
+
+        function generateSpherePositions(count, radius) {
+            const positions = [];
+            for (let i = 0; i < count; i++) {
+                const u = Math.random();
+                const v = Math.random();
+                const theta = 2 * Math.PI * u;
+                const phi = Math.acos(2 * v - 1);
+                const x = radius * Math.sin(phi) * Math.cos(theta);
+                const y = radius * Math.sin(phi) * Math.sin(theta);
+                const z = radius * Math.cos(phi);
+                positions.push(x, y, z);
+            }
+            return positions;
+        }
+
+        function createParticleSystem(geometry, material, isBloom = false, renderOrder = 0) {
+            const points = new THREE.Points(geometry, material);
+            if (isBloom) points.layers.enable(BLOOM_LAYER);
+            points.renderOrder = renderOrder;
+            allParticleSystems.push({
+                points: points,
+                geometry: geometry,
+                material: material,
+                originalPositions: geometry.attributes.position.array.slice()
+            });
+            treeGroup.add(points);
+            return points;
+        }
+
+        function makeSprite() {
+            const size = 128;
+            const canvas = document.createElement('canvas');
+            canvas.width = size; canvas.height = size;
+            const ctx = canvas.getContext('2d');
+            const g = ctx.createRadialGradient(size/2, size/2, 0, size/2, size/2, size/2);
+            g.addColorStop(0, 'rgba(255,250,230,0.95)'); g.addColorStop(0.08, 'rgba(255,235,150,0.90)');
+            g.addColorStop(0.20, 'rgba(245,200,90,0.62)'); g.addColorStop(0.42, 'rgba(220,140,50,0.30)');
+            g.addColorStop(0.70, 'rgba(160,90,40,0.12)'); g.addColorStop(1, 'rgba(0,0,0,0)');
+            ctx.fillStyle = g; ctx.fillRect(0,0,size,size);
+            const tex = new THREE.CanvasTexture(canvas); tex.needsUpdate = true; return tex;
+        }
+
+        function makeRibbonSprite() {
+            const size = 64;
+            const canvas = document.createElement('canvas');
+            canvas.width = size; canvas.height = size;
+            const ctx = canvas.getContext('2d');
+            const g = ctx.createRadialGradient(size/2, size/2, 0, size/2, size/2, size/2);
+            g.addColorStop(0, 'rgba(255,250,210,1)'); g.addColorStop(0.05, 'rgba(255,235,140,0.98)');
+            g.addColorStop(0.14, 'rgba(245,190,80,0.72)'); g.addColorStop(0.30, 'rgba(200,130,50,0.28)');
+            g.addColorStop(1, 'rgba(0,0,0,0)'); ctx.fillStyle = g; ctx.fillRect(0,0,size,size);
+            const tex = new THREE.CanvasTexture(canvas); tex.needsUpdate = true; tex.minFilter = THREE.LinearFilter; tex.magFilter = THREE.LinearFilter; return tex;
+        }
+
+        function makeTopSprite() {
+            const size = 48;
+            const canvas = document.createElement('canvas');
+            canvas.width = size; canvas.height = size;
+            const ctx = canvas.getContext('2d');
+            const g = ctx.createRadialGradient(size/2, size/2, 0, size/2, size/2, size/2);
+            g.addColorStop(0, 'rgba(255,255,230,1)'); g.addColorStop(0.035, 'rgba(255,240,160,0.98)');
+            g.addColorStop(0.09, 'rgba(230,180,100,0.6)'); g.addColorStop(0.16, 'rgba(150,100,60,0.18)');
+            g.addColorStop(1, 'rgba(0,0,0,0)'); ctx.fillStyle = g; ctx.fillRect(0,0,size,size);
+            const tex = new THREE.CanvasTexture(canvas); tex.needsUpdate = true; tex.minFilter = THREE.LinearFilter; tex.magFilter = THREE.LinearFilter; return tex;
+        }
+
+        function createTreeParticleSystem() {
+            treeGroup = new THREE.Group();
+            scene.add(treeGroup);
+            const sprite = makeSprite(), ribbonSprite = makeRibbonSprite(), topSprite = makeTopSprite();
+
+            const TREE_HEIGHT = 10;
+            const BASE_RADIUS = 4.2;
+            const GREEN_PARTICLES = 2000;
+            const ORNAMENT_COUNT = 800;
+            const RIBBON_PARTICLES = 2000;
+            const SPARKLE_COUNT = 800;
+
+            createFoliage(TREE_HEIGHT, BASE_RADIUS, GREEN_PARTICLES, sprite, topSprite);
+            createOrnaments(TREE_HEIGHT, BASE_RADIUS, ORNAMENT_COUNT, sprite);
+            createRibbon(TREE_HEIGHT, BASE_RADIUS, RIBBON_PARTICLES, ribbonSprite);
+            createSparkles(TREE_HEIGHT, BASE_RADIUS, SPARKLE_COUNT, sprite);
+            createStar(TREE_HEIGHT, sprite);
+            createGround(TREE_HEIGHT);
+
+            // 保证组位置在原点（屏幕中心）
+            treeGroup.position.set(0, 0, 0);
+            // 在场景中添加环绕的空间光点（可调整参数）
+            createAmbientDots(350, 9, 30, makeSprite());
+            
+            // 创建圣诞树模式下的额外环境光点
+            createTreeAmbientDots(800, 25, makeSprite());
+        }
+
+        function createFoliage(TREE_HEIGHT, BASE_RADIUS, GREEN_PARTICLES, sprite, topSprite) {
+            const mainPos = [], mainCol = [], topPos = [], topCol = [];
+            for (let i = 0; i < GREEN_PARTICLES; i++) {
+                const h = Math.pow(Math.random(), 0.85);
+                const y = h * TREE_HEIGHT;
+                const radius = BASE_RADIUS * (1 - (y/TREE_HEIGHT)) * (0.5 + Math.random()*0.8);
+                const angle = Math.random()*Math.PI*2;
+                const r = radius * Math.sqrt(Math.random());
+                const x = r * Math.cos(angle);
+                const z = r * Math.sin(angle);
+                const px = x + (Math.random()-0.5)*0.04;
+                const py = y - TREE_HEIGHT/2;
+                const pz = z + (Math.random()-0.5)*0.04;
+                const gBase = new THREE.Color(0x2d5a3d);
+                const gRand = gBase.clone().offsetHSL(0.02, -0.05 + Math.random()*0.05, -0.08 + Math.random()*0.06);
+                if (y / TREE_HEIGHT > 0.78) {
+                    topPos.push(px, py, pz); topCol.push(gRand.r, gRand.g, gRand.b);
+                } else {
+                    mainPos.push(px, py, pz); mainCol.push(gRand.r, gRand.g, gRand.b);
+                }
+            }
+
+            const mainGeo = new THREE.BufferGeometry();
+            mainGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(mainPos), 3));
+            mainGeo.setAttribute('color', new THREE.BufferAttribute(new Float32Array(mainCol), 3));
+            const mainMat = new THREE.PointsMaterial({
+                size: 0.24 * (window.innerWidth/1200),
+                map: sprite,
+                vertexColors: true,
+                transparent: true,
+                opacity: 0.85,
+                depthWrite: false,
+                sizeAttenuation: true,
+                blending: THREE.NormalBlending
+            });
+            createParticleSystem(mainGeo, mainMat, false, 1);
+
+            if (topPos.length > 0) {
+                const topGeo = new THREE.BufferGeometry();
+                topGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(topPos), 3));
+                topGeo.setAttribute('color', new THREE.BufferAttribute(new Float32Array(topCol), 3));
+                const topMat = new THREE.PointsMaterial({
+                    size: 0.08 * (window.innerWidth/1200),
+                    map: topSprite,
+                    vertexColors: true,
+                    transparent: true,
+                    opacity: 0.95,
+                    depthWrite: true,
+                    depthTest: true,
+                    alphaTest: 0.12,
+                    sizeAttenuation: true,
+                    blending: THREE.NormalBlending
+                });
+                createParticleSystem(topGeo, topMat, false, 2);
+            }
+        }
+
+        function createOrnaments(TREE_HEIGHT, BASE_RADIUS, ORNAMENT_COUNT, sprite) {
+            const geometry = new THREE.BufferGeometry();
+            const positions = new Float32Array(ORNAMENT_COUNT*3);
+            const colors = new Float32Array(ORNAMENT_COUNT*3);
+            let vi = 0, ci = 0;
+            const palette = {
+                gold: new THREE.Color(0xEFC65A),
+                red: new THREE.Color(0xC6282E),
+                silver: new THREE.Color(0xD8DDE0),
+                emerald: new THREE.Color(0x2EC06E)
+            };
+            for (let i = 0; i < ORNAMENT_COUNT; i++) {
+                const h = Math.random();
+                const y = h * TREE_HEIGHT;
+                const radius = BASE_RADIUS * (1 - (y/TREE_HEIGHT)) * (0.7 + Math.random()*0.3);
+                const angle = Math.random()*Math.PI*2;
+                const r = radius * Math.sqrt(Math.random());
+                const x = r * Math.cos(angle);
+                const z = r * Math.sin(angle);
+
+                positions[vi++] = x + (Math.random()-0.5)*0.12;
+                positions[vi++] = y - TREE_HEIGHT/2;
+                positions[vi++] = z + (Math.random()-0.5)*0.12;
+
+                const rsel = Math.random();
+                let col;
+                if (rsel < 0.55) col = palette.gold;
+                else if (rsel < 0.75) col = palette.red;
+                else if (rsel < 0.90) col = palette.silver;
+                else col = palette.emerald;
+                colors[ci++] = col.r; colors[ci++] = col.g; colors[ci++] = col.b;
+            }
+            geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+            geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+            const material = new THREE.PointsMaterial({
+                size: 0.45 * (window.innerWidth/1200),
+                map: sprite,
+                vertexColors: true,
+                transparent: true,
+                opacity: 0.88,
+                depthWrite: false,
+                depthTest: false,
+                sizeAttenuation: true,
+                blending: THREE.AdditiveBlending
+            });
+            createParticleSystem(geometry, material, true, 3);
+        }
+
+        function createRibbon(TREE_HEIGHT, BASE_RADIUS, RIBBON_PARTICLES, ribbonSprite) {
+            const turns = 5.0;
+            const geometry = new THREE.BufferGeometry();
+            const positions = new Float32Array(RIBBON_PARTICLES * 3);
+            const colors = new Float32Array(RIBBON_PARTICLES * 3);
+            let vi = 0, ci = 0;
+            for (let i = 0; i < RIBBON_PARTICLES; i++) {
+                const t = i / RIBBON_PARTICLES;
+                const y = t * TREE_HEIGHT;
+                const frac = 1 - (y / TREE_HEIGHT);
+                const radius = BASE_RADIUS * frac * (0.85 + 0.08 * Math.sin(i*0.17));
+                const angle = t * turns * Math.PI * 2.0 + Math.sin(i*0.11)*0.28;
+                const x = Math.cos(angle) * radius;
+                const z = Math.sin(angle) * radius;
+                const off = 0.06 * (0.5 - Math.random());
+                positions[vi++] = x + off;
+                positions[vi++] = y - TREE_HEIGHT/2 + (Math.sin(i*0.3)*0.015);
+                positions[vi++] = z - off;
+                const col = new THREE.Color().setHSL(0.12 + (Math.random()-0.5)*0.015, 0.88, 0.48 + (Math.random()-0.5)*0.04);
+                colors[ci++] = col.r; colors[ci++] = col.g; colors[ci++] = col.b;
+            }
+            geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+            geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+
+            const edgeMat = new THREE.PointsMaterial({
+                size: 0.34 * (window.innerWidth/1200),
+                map: ribbonSprite,
+                vertexColors: true,
+                transparent: true,
+                opacity: 0.28,
+                depthWrite: false,
+                depthTest: false,
+                sizeAttenuation: true,
+                blending: THREE.NormalBlending
+            });
+            createParticleSystem(geometry, edgeMat, true, 5);
+
+            const coreMat = new THREE.PointsMaterial({
+                size: 0.20 * (window.innerWidth/1200),
+                map: ribbonSprite,
+                vertexColors: true,
+                transparent: true,
+                opacity: 0.88,
+                depthWrite: false,
+                depthTest: true,
+                sizeAttenuation: true,
+                blending: THREE.NormalBlending
+            });
+            createParticleSystem(geometry, coreMat, false, 4);
+
+            const lineMat = new THREE.PointsMaterial({
+                size: 0.12 * (window.innerWidth/1200),
+                map: ribbonSprite,
+                color: 0xFFF3C0,
+                transparent: true,
+                opacity: 0.95,
+                depthWrite: false,
+                depthTest: true,
+                sizeAttenuation: true,
+                blending: THREE.NormalBlending
+            });
+            createParticleSystem(geometry, lineMat, true, 6);
+        }
+
+        function createAmbientDots(count = 300, innerRadius = 8, outerRadius = 28, sprite = null) {
+            if (!sprite) sprite = makeSprite(); // 复用已有的暖色 sprite
+            const geometry = new THREE.BufferGeometry();
+            const positions = new Float32Array(count * 3);
+            const basePositions = new Float32Array(count * 3);
+            const colors = new Float32Array(count * 3);
+            const phases = new Float32Array(count);
+
+            for (let i = 0; i < count; i++) {
+                // 随机球壳分布（在 innerRadius~outerRadius 之间随机）
+                const r = innerRadius + Math.random() * (outerRadius - innerRadius);
+                // 均匀球面分布
+                const u = Math.random();
+                const v = Math.random();
+                const theta = 2 * Math.PI * u;
+                const phi = Math.acos(2 * v - 1);
+                const x = r * Math.sin(phi) * Math.cos(theta);
+                const y = r * Math.sin(phi) * Math.sin(theta);
+                const z = r * Math.cos(phi);
+
+                const i3 = i * 3;
+                // 基础位置
+                basePositions[i3] = x + (Math.random() - 0.5) * 0.6; // 轻微扰动
+                basePositions[i3 + 1] = y + (Math.random() - 0.5) * 0.6;
+                basePositions[i3 + 2] = z + (Math.random() - 0.5) * 0.6;
+
+                // 初始位置与 colors
+                positions[i3] = basePositions[i3];
+                positions[i3 + 1] = basePositions[i3 + 1];
+                positions[i3 + 2] = basePositions[i3 + 2];
+
+                // 颜色：暖色和冷色小范围混合，靠近白色的发光色
+                const vcol = 0.8 + Math.random() * 0.4;
+                const hueRand = (Math.random() - 0.5) * 0.06; // 小色相抖动
+                const col = new THREE.Color().setHSL(0.10 + hueRand, 0.9, 0.5 * vcol);
+                colors[i3] = col.r; colors[i3 + 1] = col.g; colors[i3 + 2] = col.b;
+
+                // 随机相位用于动画偏移
+                phases[i] = Math.random() * Math.PI * 2;
+            }
+
+            geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+            geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+
+            const mat = new THREE.PointsMaterial({
+                size: 0.06 * (window.innerWidth / 1200), // 你可以调节全局大小
+                map: sprite,
+                vertexColors: true,
+                transparent: true,
+                opacity: 0.65,
+                depthTest: false,
+                depthWrite: false,
+                sizeAttenuation: true,
+                blending: THREE.AdditiveBlending
+            });
+
+            const points = new THREE.Points(geometry, mat);
+            // 让这些点进入 Bloom 层以便有发光效果
+            points.layers.enable(BLOOM_LAYER);
+            points.renderOrder = 0;
+            scene.add(points); // 放到 scene（不随树旋转），需环绕场景
+
+            ambientPointsData = {
+                points,
+                geometry,
+                basePositions,
+                phases,
+                count
+            };
+        }
+
+        // 创建圣诞树模式下的额外环境光点
+        function createTreeAmbientDots(count = 800, spread = 25, sprite = null) {
+            if (!sprite) sprite = makeSprite();
+            const geometry = new THREE.BufferGeometry();
+            const positions = new Float32Array(count * 3);
+            const basePositions = new Float32Array(count * 3);
+            const colors = new Float32Array(count * 3);
+            const phases = new Float32Array(count);
+
+            for (let i = 0; i < count; i++) {
+                // 在整个场景中均匀分布
+                const x = (Math.random() - 0.5) * spread;
+                const y = (Math.random() - 0.5) * spread;
+                const z = (Math.random() - 0.5) * spread;
+
+                const i3 = i * 3;
+                basePositions[i3] = x;
+                basePositions[i3 + 1] = y;
+                basePositions[i3 + 2] = z;
+
+                positions[i3] = x;
+                positions[i3 + 1] = y;
+                positions[i3 + 2] = z;
+
+                // 使用更丰富的颜色
+                const hue = Math.random();
+                const saturation = 0.7 + Math.random() * 0.3;
+                const lightness = 0.5 + Math.random() * 0.3;
+                const col = new THREE.Color().setHSL(hue, saturation, lightness);
+                colors[i3] = col.r;
+                colors[i3 + 1] = col.g;
+                colors[i3 + 2] = col.b;
+
+                phases[i] = Math.random() * Math.PI * 2;
+            }
+
+            geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+            geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+
+            const mat = new THREE.PointsMaterial({
+                size: 0.08 * (window.innerWidth / 1200),
+                map: sprite,
+                vertexColors: true,
+                transparent: true,
+                opacity: 0.0, // 初始透明度为0，在tree模式下逐渐显现
+                depthTest: false,
+                depthWrite: false,
+                sizeAttenuation: true,
+                blending: THREE.AdditiveBlending
+            });
+
+            const points = new THREE.Points(geometry, mat);
+            points.layers.enable(BLOOM_LAYER);
+            points.renderOrder = 0;
+            scene.add(points);
+
+            treeAmbientPointsData = {
+                points,
+                geometry,
+                basePositions,
+                phases,
+                count,
+                targetOpacity: 0.7
+            };
+        }
+
+
+        function createSparkles(TREE_HEIGHT, BASE_RADIUS, SPARKLE_COUNT, sprite) {
+            const geometry = new THREE.BufferGeometry();
+            const positions = new Float32Array(SPARKLE_COUNT*3);
+            const colors = new Float32Array(SPARKLE_COUNT*3);
+            let vi = 0, ci = 0;
+            for (let i = 0; i < SPARKLE_COUNT; i++) {
+                const h = Math.random();
+                const y = h * TREE_HEIGHT;
+                const radius = BASE_RADIUS * (1 - (y/TREE_HEIGHT)) * (0.9 + Math.random()*0.8);
+                const angle = Math.random()*Math.PI*2;
+                const r = radius * (0.9 + Math.random()*0.7);
+                const x = r * Math.cos(angle);
+                const z = r * Math.sin(angle);
+                positions[vi++] = x + (Math.random()-0.5)*0.2;
+                positions[vi++] = y - TREE_HEIGHT/2 + (Math.random()-0.5)*0.4;
+                positions[vi++] = z + (Math.random()-0.5)*0.2;
+                const v = 0.9 + Math.random()*0.2;
+                colors[ci++] = v; colors[ci++] = 0.75 * v; colors[ci++] = 0.25 * v;
+            }
+            geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+            geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+            const material = new THREE.PointsMaterial({
+                size: 0.12 * (window.innerWidth/1200),
+                map: sprite,
+                vertexColors: true,
+                transparent: true,
+                opacity: 0.7,
+                depthWrite: false,
+                depthTest: false,
+                sizeAttenuation: true,
+                blending: THREE.AdditiveBlending
+            });
+            createParticleSystem(geometry, material, true, 7);
+        }
+
+        function createStar(TREE_HEIGHT, sprite) {
+            const geometry = new THREE.BufferGeometry();
+            const pos = new Float32Array([0, TREE_HEIGHT - TREE_HEIGHT/2 + 0.5, 0]);
+            geometry.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+            const material = new THREE.PointsMaterial({
+                size: 0.9,
+                map: sprite,
+                color: 0xFFD700,
+                transparent: true,
+                blending: THREE.AdditiveBlending,
+                depthWrite: false
+            });
+            createParticleSystem(geometry, material, true, 8);
+        }
+
+        function createGround(TREE_HEIGHT) {
+            const geo = new THREE.PlaneGeometry(60, 60);
+            const mat = new THREE.MeshBasicMaterial({color: 0x040404, transparent: true, opacity: 1});
+            const plane = new THREE.Mesh(geo, mat);
+            plane.rotation.x = -Math.PI/2;
+            plane.position.y = -TREE_HEIGHT/2 - 0.02;
+            scene.add(plane);
+        }
+
+        // 检测拨动（注意：当手势为捏合或握拳时不进行拨动检测）
+        function detectSwipe(landmarks) {
+            // 新增：握拳时短路，不触发拨动
+            if (isFist(landmarks)) { lastFingersCenterPos = null; return null; }
+
+            // 捏合时短路，不触发拨动
+            if (isPinch(landmarks)) { lastFingersCenterPos = null; return null; }
+
+            if (!lastWristPos || !lastFingersCenterPos) {
+                const fingers = [landmarks[8], landmarks[12], landmarks[16], landmarks[20]];
+                lastFingersCenterPos = { x: (fingers[0].x + fingers[1].x + fingers[2].x + fingers[3].x) / 4, y: (fingers[0].y + fingers[1].y + fingers[2].y + fingers[3].y) / 4 };
+                lastSwipeTime = Date.now(); return null;
+            }
+            const palmCenter = landmarks[0];
+            const thumbTip = landmarks[4];
+            const indexTip = landmarks[8];
+            const middleTip = landmarks[12];
+            const ringTip = landmarks[16];
+            const pinkyTip = landmarks[20];
+
+            const palmDeltaX = Math.abs(palmCenter.x - lastWristPos.x);
+            const palmDeltaY = Math.abs(palmCenter.y - lastWristPos.y);
+            const palmMovement = Math.sqrt(palmDeltaX * palmDeltaX + palmDeltaY * palmDeltaY);
+            const PALM_THRESHOLD = 0.03;
+            if (palmMovement > PALM_THRESHOLD) {
+                lastWristPos = { x: palmCenter.x, y: palmCenter.y };
+                lastFingersCenterPos = { x: (indexTip.x + middleTip.x + ringTip.x + pinkyTip.x) / 4, y: (indexTip.y + middleTip.y + ringTip.y + pinkyTip.y) / 4 };
+                lastSwipeTime = Date.now(); return null;
+            }
+
+            const thumbAbovePalm = thumbTip.y < palmCenter.y - 0.08;
+            if (!thumbAbovePalm) {
+                lastFingersCenterPos = { x: (indexTip.x + middleTip.x + ringTip.x + pinkyTip.x) / 4, y: (indexTip.y + middleTip.y + ringTip.y + pinkyTip.y) / 4 };
+                lastSwipeTime = Date.now(); return null;
+            }
+
+            const currentFingersCenterX = (indexTip.x + middleTip.x + ringTip.x + pinkyTip.x) / 4;
+            const fingerDeltaX = currentFingersCenterX - lastFingersCenterPos.x;
+            const fingerDistance = Math.abs(fingerDeltaX);
+            const currentTime = Date.now();
+            const timeDelta = Math.max(currentTime - lastSwipeTime, 16);
+            const timeDeltaSec = timeDelta / 1000;
+            const handSize = Math.hypot(palmCenter.x - middleTip.x, palmCenter.y - middleTip.y) || 0.0001;
+            const relDistance = fingerDistance / handSize;
+            const swipeSpeed = relDistance / Math.max(timeDeltaSec, 0.001);
+            const SWIPE_THRESHOLD = 0.03;
+            let swipeDirection = null;
+
+            if (fingerDistance > SWIPE_THRESHOLD) {
+                const direction = fingerDeltaX > 0 ? '右' : '左';
+                const speedLabel = swipeSpeed > 1.5 ? '快速' : '慢速';
+                const directionFactor = fingerDeltaX > 0 ? 1 : -1;
+
+                // --- 如果在阻止窗口内且为相反方向，则忽略这次判定 ---
+                const sinceLastDetected = currentTime - lastDetectedSwipeTimestamp;
+                const isOpposite = lastDetectedSwipeDirection !== 0 && directionFactor === -lastDetectedSwipeDirection;
+                if (isOpposite && sinceLastDetected < SWIPE_BLOCK_MS) {
+                    // 被阻止：不把它当作一次新的拨动（但仍更新内部位置以避免抖动）
+                    lastWristPos = { x: palmCenter.x, y: palmCenter.y };
+                    lastFingersCenterPos = { x: currentFingersCenterX, y: (indexTip.y + middleTip.y + ringTip.y + pinkyTip.y) / 4 };
+                    lastSwipeTime = currentTime;
+                    return null;
+                }
+
+                // 允许判定：记录并用作旋转动力信息
+                swipeDirection = `${speedLabel}${direction}`;
+                lastSwipeInfo = { direction: directionFactor, swipeSpeed: swipeSpeed, speedLabel };
+                // 记录这次成功判定的方向和时间（用于阻止短时间内相反方向）
+                lastDetectedSwipeDirection = directionFactor;
+                lastDetectedSwipeTimestamp = currentTime;
+            }
+
+            // 更新位置与时间（无论是否判定成功都更新，用于稳定后续检测）
+            lastWristPos = { x: palmCenter.x, y: palmCenter.y };
+            lastFingersCenterPos = { x: currentFingersCenterX, y: (indexTip.y + middleTip.y + ringTip.y + pinkyTip.y) / 4 };
+            lastSwipeTime = currentTime;
+            return swipeDirection;
+        }
+
+        function isFist(landmarks) {
+            const wrist = landmarks[0];
+            const thumbTip = landmarks[4];
+            const indexTip = landmarks[8];
+            const middleTip = landmarks[12];
+            const ringTip = landmarks[16];
+            const pinkyTip = landmarks[20];
+            const distance = (p1, p2) => Math.hypot(p1.x - p2.x, p1.y - p2.y, p1.z - p2.z);
+            const thumbDistance = distance(thumbTip, wrist);
+            const indexDistance = distance(indexTip, wrist);
+            const middleDistance = distance(middleTip, wrist);
+            const ringDistance = distance(ringTip, wrist);
+            const pinkyDistance = distance(pinkyTip, wrist);
+            const avgDistance = (thumbDistance + indexDistance + middleDistance + ringDistance + pinkyDistance) / 5;
+            return avgDistance < 0.25;
+        }
+
+        // 更新粒子位置（树 ↔ 球），保持中心在原点
+        function updateParticlePositions() {
+            if (sphereModeProgress === 0 && !particleSphereMode) return;
+            if (sphereModeProgress === 1 && particleSphereMode) return;
+
+            if (particleSphereMode && sphereModeProgress < 1) {
+                sphereModeProgress = Math.min(1, sphereModeProgress + TRANSITION_SPEED);
+            } else if (!particleSphereMode && sphereModeProgress > 0) {
+                sphereModeProgress = Math.max(0, sphereModeProgress - TRANSITION_SPEED);
+            }
+
+            transitionText.textContent = `${Math.round(sphereModeProgress * 100)}%`;
+
+            // 更新圣诞树模式下额外环境光点的透明度
+            if (treeAmbientPointsData) {
+                const treePointsOpacity = particleSphereMode ? 0.0 : treeAmbientPointsData.targetOpacity * (1 - sphereModeProgress);
+                treeAmbientPointsData.points.material.opacity = treePointsOpacity;
+            }
+
+            allParticleSystems.forEach((system) => {
+                const positions = system.geometry.attributes.position.array;
+                const originalPositions = system.originalPositions;
+                const spherePositions = system.spherePositions;
+                if (!spherePositions) return;
+                const easedProgress = easeInOutCubic(sphereModeProgress);
+
+                // 计算系统原始中心（tree 中心），把原始位置转换为相对于该中心的偏移
+                let sumX = 0, sumY = 0, sumZ = 0;
+                for (let i = 0; i < originalPositions.length; i += 3) {
+                    sumX += originalPositions[i];
+                    sumY += originalPositions[i + 1];
+                    sumZ += originalPositions[i + 2];
+                }
+                const count = originalPositions.length / 3 || 1;
+                const treeCenterX = sumX / count;
+                const treeCenterY = sumY / count;
+                const treeCenterZ = sumZ / count;
+
+                for (let i = 0; i < positions.length; i += 3) {
+                    // 原始位置相对于 tree 中心（使树在原点时居中）
+                    const origRelX = originalPositions[i] - treeCenterX;
+                    const origRelY = originalPositions[i + 1] - treeCenterY;
+                    const origRelZ = originalPositions[i + 2] - treeCenterZ;
+
+                    if (particleSphereMode) {
+                        // 从树的相对位置过渡到球体位置（球体位置系以场景原点为中心）
+                        positions[i] = origRelX + (spherePositions[i] - origRelX) * easedProgress;
+                        positions[i + 1] = origRelY + (spherePositions[i + 1] - origRelY) * easedProgress;
+                        positions[i + 2] = origRelZ + (spherePositions[i + 2] - origRelZ) * easedProgress;
+                    } else {
+                        // 从球体回到树的相对位置（注意：spherePositions 是以原点为中心）
+                        positions[i] = spherePositions[i] + (origRelX - spherePositions[i]) * (1 - easedProgress);
+                        positions[i + 1] = spherePositions[i + 1] + (origRelY - spherePositions[i + 1]) * (1 - easedProgress);
+                        positions[i + 2] = spherePositions[i + 2] + (origRelZ - spherePositions[i + 2]) * (1 - easedProgress);
+                    }
+                }
+                system.geometry.attributes.position.needsUpdate = true;
+            });
+        }
+
+        function easeInOutCubic(t) { return t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2; }
+
+        function updateModeDisplay() {
+            if (particleSphereMode) {
+                modeText.textContent = "粒子球";
+                modeIndicator.className = "mode-indicator mode-sphere";
+            } else {
+                modeText.textContent = "圣诞树";
+                modeIndicator.className = "mode-indicator mode-tree";
+            }
+        }
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        async function initCamera() {
+            const videoElement = document.getElementById('video');
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' } });
+                videoElement.srcObject = stream;
+                const cameraFeed = new Camera(videoElement, {
+                    onFrame: async () => { await hands.send({ image: videoElement }); },
+                    width: 640, height: 480
+                });
+                cameraFeed.start();
+            } catch (error) {
+                console.error("摄像头初始化失败:", error);
+                gestureText.textContent = "摄像头初始化失败，请确保已授权摄像头访问";
+            }
+        }
+
+        function animate() {
+            requestAnimationFrame(animate);
+
+            updateParticlePositions();
+            updateAmbientDots();
+            updateTreeAmbientDots(); // 更新圣诞树模式下的额外环境光点
+
+            // 应用自动旋转和手势旋转
+            if (Math.abs(rotationVelocity) > 0.001) {
+                // 使用手势旋转速度
+                treeGroup.rotation.y += rotationVelocity * rotationDirection;
+                rotationVelocity *= 0.95; // 逐渐减速
+                
+                // 更新旋转方向文本
+                if (rotationDirection === 1) {
+                    rotationText.textContent = "向右";
+                } else {
+                    rotationText.textContent = "向左";
+                }
+                
+                // 当速度降到很小时停止
+                if (Math.abs(rotationVelocity) < 0.001) {
+                    rotationVelocity = 0;
+                }
+            } else {
+                // 没有手势输入时使用默认自动旋转
+                treeGroup.rotation.y += autoRotationSpeed * rotationDirection;
+                rotationText.textContent = rotationDirection === 1 ? "向右(自动)" : "向左(自动)";
+            }
+
+            // 强制保持垂直（X 和 Z 轴恒为 0）
+            treeGroup.rotation.x = 0;
+            treeGroup.rotation.z = 0;
+
+            // 相机保持固定并一直看向场景原点（树/球中心）
+            camera.lookAt(0, 0, 0);
+
+            updateAmbientDots();
+            renderer.render(scene, camera);
+        }
+
+        function updateAmbientDots() {
+            if (!ambientPointsData) return;
+            const now = performance.now() / 1000;
+            const geom = ambientPointsData.geometry;
+            const pos = geom.attributes.position.array;
+            const base = ambientPointsData.basePositions;
+            const phases = ambientPointsData.phases;
+            const count = ambientPointsData.count;
+
+            // 动态参数（可调）
+            const amp = 0.25;    // 漂移幅度（单位：世界坐标）
+            const speed = 0.6;   // 漂移速度
+            for (let i = 0; i < count; i++) {
+                const i3 = i * 3;
+                // 三轴分别用不同频率和相位微动
+                pos[i3]     = base[i3]     + Math.sin(now * speed + phases[i]) * (amp * 0.6);
+                pos[i3 + 1] = base[i3 + 1] + Math.sin(now * speed * 1.2 + phases[i] * 1.3) * (amp * 0.9);
+                pos[i3 + 2] = base[i3 + 2] + Math.cos(now * speed * 0.8 + phases[i] * 0.7) * (amp * 0.5);
+            }
+            geom.attributes.position.needsUpdate = true;
+
+            // 可选：整体周期性淡入淡出增强"闪烁"感
+            const mat = ambientPointsData.points.material;
+            mat.opacity = 0.55 + Math.sin(now * 0.9) * 0.12; // 全局微闪
+        }
+
+        // 更新圣诞树模式下的额外环境光点
+        function updateTreeAmbientDots() {
+            if (!treeAmbientPointsData || particleSphereMode) return;
+            
+            const now = performance.now() / 1000;
+            const geom = treeAmbientPointsData.geometry;
+            const pos = geom.attributes.position.array;
+            const base = treeAmbientPointsData.basePositions;
+            const phases = treeAmbientPointsData.phases;
+            const count = treeAmbientPointsData.count;
+
+            // 动态参数（可调）
+            const amp = 0.3;    // 漂移幅度（单位：世界坐标）
+            const speed = 0.5;   // 漂移速度
+            for (let i = 0; i < count; i++) {
+                const i3 = i * 3;
+                // 三轴分别用不同频率和相位微动
+                pos[i3]     = base[i3]     + Math.sin(now * speed + phases[i]) * amp;
+                pos[i3 + 1] = base[i3 + 1] + Math.sin(now * speed * 1.3 + phases[i] * 1.2) * amp;
+                pos[i3 + 2] = base[i3 + 2] + Math.cos(now * speed * 0.7 + phases[i] * 0.8) * amp;
+            }
+            geom.attributes.position.needsUpdate = true;
+
+            // 周期性淡入淡出增强"闪烁"感
+            const mat = treeAmbientPointsData.points.material;
+            mat.opacity = (0.4 + Math.sin(now * 0.7) * 0.2) * (1 - sphereModeProgress);
+        }
+
+
+        // 启动
+        window.addEventListener('load', async () => {
+            gestureText = document.getElementById('gestureText');
+            handStatusText = document.getElementById('handStatusText');
+            modeText = document.getElementById('modeText');
+            modeIndicator = document.getElementById('modeIndicator');
+            transitionText = document.getElementById('transitionText');
+            rotationText = document.getElementById('rotationText');
+
+            initThreeJS();
+            await initCamera();
+            updateModeDisplay();
+        });
+    </script>
+</body>
+</html>
